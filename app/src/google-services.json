@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1081817472432",
+    "project_id": "invendiario",
+    "storage_bucket": "invendiario.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1081817472432:android:854180b3604fe71819ca75",
+        "android_client_info": {
+          "package_name": "com.example.invendiario"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD5CzQ4J6x7WRQf-Q7zdsJKwtJojDC0IIg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
