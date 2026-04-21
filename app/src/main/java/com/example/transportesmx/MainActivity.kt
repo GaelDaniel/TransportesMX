@@ -44,7 +44,11 @@ import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.ValueEventListener
 import com.google.firebase.database.ktx.database
 import com.google.firebase.ktx.Firebase
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapEventsReceiver
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
@@ -284,6 +288,7 @@ fun ManagerDashboardRefactored(currentUser: UserData, selectedTab: Int, onViewRo
     var usersList by remember { mutableStateOf<List<UserData>>(emptyList()) }
     var unitsList by remember { mutableStateOf<List<UnitData>>(emptyList()) }
     var routesList by remember { mutableStateOf<List<RouteData>>(emptyList()) }
+    var fuelList by remember { mutableStateOf<List<FuelData>>(emptyList()) }
     
     val db = Firebase.database("https://invendiario-default-rtdb.firebaseio.com/").reference
 
@@ -300,6 +305,10 @@ fun ManagerDashboardRefactored(currentUser: UserData, selectedTab: Int, onViewRo
             override fun onDataChange(s: DataSnapshot) { routesList = s.children.mapNotNull { it.getValue(RouteData::class.java) } }
             override fun onCancelled(e: DatabaseError) {}
         })
+        db.child("fuel").orderByChild("empresaId").equalTo(currentUser.empresaId).addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(s: DataSnapshot) { fuelList = s.children.mapNotNull { it.getValue(FuelData::class.java) } }
+            override fun onCancelled(e: DatabaseError) {}
+        })
     }
     
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
@@ -310,10 +319,23 @@ fun ManagerDashboardRefactored(currentUser: UserData, selectedTab: Int, onViewRo
                 LazyColumn(modifier = Modifier.weight(1f)) { items(usersList) { user -> UserItem(user, { db.child("users").child(user.uid).removeValue() }, { db.child("users").child(user.uid).child("role").setValue(it) }) } }
             }
             1 -> {
-                Box(modifier = Modifier.fillMaxWidth().height(300.dp).clip(RectangleShape).background(Color.DarkGray)) {
-                    OSMView(Modifier.fillMaxSize(), units = unitsList)
+                // Construir puntos de origen por unidad a partir de sus rutas asignadas
+                val unitsWithOrigin = unitsList.mapNotNull { unit ->
+                    val ruta = routesList.firstOrNull { it.unitId == unit.id && it.origenLat != 0.0 }
+                    if (ruta != null) unit.copy(lastLat = ruta.origenLat, lastLng = ruta.origenLng) else null
                 }
-                Spacer(modifier = Modifier.height(16.dp))
+                Box(modifier = Modifier.fillMaxWidth().height(300.dp).clip(RectangleShape).background(Color.DarkGray)) {
+                    OSMView(Modifier.fillMaxSize(), units = unitsWithOrigin)
+                }
+                if (unitsWithOrigin.isEmpty() && unitsList.isNotEmpty()) {
+                    Text(
+                        "Las unidades aparecerán en el mapa al asignarles una ruta con origen.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 4.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { showCreateUnitDialog = true }, modifier = Modifier.weight(1f)) { Text("Nueva Unidad") }
                     Button(onClick = { showCreateRouteDialog = true }, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)) { Text("Asignar Ruta") }
@@ -322,9 +344,9 @@ fun ManagerDashboardRefactored(currentUser: UserData, selectedTab: Int, onViewRo
                 Button(onClick = onViewRoutes, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary)) {
                     Icon(Icons.Default.List, null); Spacer(Modifier.width(8.dp)); Text("Ver Viajes Asignados")
                 }
-                LazyColumn(modifier = Modifier.weight(1f)) { items(unitsList) { unit -> UnitItem(unit, { db.child("unidades").child(unit.id).removeValue() }) } }
+                LazyColumn(modifier = Modifier.weight(1f)) { items(unitsList) { unit -> UnitItem(unit, currentUser.empresaId, { db.child("unidades").child(unit.id).removeValue() }) } }
             }
-            2 -> MetricsScreen(routesList, unitsList)
+            2 -> MetricsScreen(routesList, unitsList, fuelList)
         }
 
         if (showCreateUserDialog) CreateUserDialog(currentUser, { showCreateUserDialog = false })
@@ -494,10 +516,81 @@ fun RouteSelector(routes: List<RouteData>, selectedRoute: RouteData?, onSelect: 
     }
 }
 
+// Geocodificación inversa con Nominatim: coordenadas → nombre legible
+suspend fun reverseGeocode(lat: Double, lng: Double): String {
+    return try {
+        val url = "https://nominatim.openstreetmap.org/reverse" +
+                "?lat=$lat&lon=$lng&format=json&accept-language=es"
+        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        conn.setRequestProperty("User-Agent", "TransportesMX/1.0")
+        conn.connectTimeout = 6000
+        conn.readTimeout = 6000
+        val json = org.json.JSONObject(conn.inputStream.bufferedReader().readText())
+        // Intentar obtener nombre en orden de preferencia
+        val addr = json.optJSONObject("address")
+        val name = json.optString("display_name", "")
+        when {
+            addr != null -> {
+                val road    = addr.optString("road", "")
+                val suburb  = addr.optString("suburb", addr.optString("neighbourhood", ""))
+                val city    = addr.optString("city", addr.optString("town", addr.optString("municipality", "")))
+                listOf(road, suburb, city).filter { it.isNotBlank() }.take(2).joinToString(", ")
+            }
+            name.isNotBlank() -> name.split(",").take(2).joinToString(",").trim()
+            else -> String.format("%.4f, %.4f", lat, lng)
+        }
+    } catch (e: Exception) {
+        String.format("%.4f, %.4f", lat, lng) // fallback a coordenadas si falla
+    }
+}
+
+
+suspend fun fetchOsrmRoute(start: GeoPoint, end: GeoPoint): List<GeoPoint> {
+    return try {
+        val url = "https://router.project-osrm.org/route/v1/driving/" +
+                "${start.longitude},${start.latitude};" +
+                "${end.longitude},${end.latitude}" +
+                "?overview=full&geometries=geojson"
+        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        conn.connectTimeout = 8000
+        conn.readTimeout = 8000
+        val json = org.json.JSONObject(conn.inputStream.bufferedReader().readText())
+        val coords = json.getJSONArray("routes")
+            .getJSONObject(0)
+            .getJSONObject("geometry")
+            .getJSONArray("coordinates")
+        (0 until coords.length()).map { i ->
+            val pt = coords.getJSONArray(i)
+            GeoPoint(pt.getDouble(1), pt.getDouble(0))
+        }
+    } catch (e: Exception) {
+        listOf(start, end) // fallback: línea recta
+    }
+}
+
 @Composable
-fun OSMView(modifier: Modifier, onPointSelected: ((GeoPoint) -> Unit)? = null, startPoint: GeoPoint? = null, endPoint: GeoPoint? = null, units: List<UnitData> = emptyList()) {
+fun OSMView(
+    modifier: Modifier,
+    onPointSelected: ((GeoPoint) -> Unit)? = null,
+    startPoint: GeoPoint? = null,
+    endPoint: GeoPoint? = null,
+    units: List<UnitData> = emptyList()
+) {
     val context = LocalContext.current
     val mapView = remember { MapView(context) }
+    // Guardamos los puntos de ruta calculados por OSRM
+    var routePoints by remember { mutableStateOf<List<GeoPoint>>(emptyList()) }
+
+    // Cuando cambian start/end, pedimos la ruta a OSRM en background
+    LaunchedEffect(startPoint, endPoint) {
+        if (startPoint != null && endPoint != null) {
+            routePoints = withContext(Dispatchers.IO) {
+                fetchOsrmRoute(startPoint, endPoint)
+            }
+        } else {
+            routePoints = emptyList()
+        }
+    }
 
     AndroidView(
         factory = {
@@ -509,8 +602,15 @@ fun OSMView(modifier: Modifier, onPointSelected: ((GeoPoint) -> Unit)? = null, s
                 if (onPointSelected != null) {
                     val overlay = MapEventsOverlay(object : MapEventsReceiver {
                         override fun singleTapConfirmedHelper(p: GeoPoint): Boolean {
-                            onPointSelected(p); val marker = Marker(mapView); marker.position = p; marker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                            mapView.overlays.removeAll { it is Marker && it.title == "Seleccionado" }; marker.title = "Seleccionado"; mapView.overlays.add(marker); mapView.invalidate(); return true
+                            onPointSelected(p)
+                            val marker = Marker(mapView)
+                            marker.position = p
+                            marker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                            mapView.overlays.removeAll { it is Marker && it.title == "Seleccionado" }
+                            marker.title = "Seleccionado"
+                            mapView.overlays.add(marker)
+                            mapView.invalidate()
+                            return true
                         }
                         override fun longPressHelper(p: GeoPoint): Boolean = false
                     })
@@ -520,46 +620,197 @@ fun OSMView(modifier: Modifier, onPointSelected: ((GeoPoint) -> Unit)? = null, s
         },
         update = { map ->
             map.overlays.removeAll { it is Marker || it is Polyline }
-            // Pintar Unidades (Trailer Azul Marino)
+
+            // Pintar unidades (marcador azul marino en origen de su ruta)
             units.forEach { unit ->
                 if (unit.lastLat != 0.0) {
-                    val m = Marker(map); m.position = GeoPoint(unit.lastLat, unit.lastLng); m.title = "Eco: ${unit.numeroEconomico}"
+                    val m = Marker(map)
+                    m.position = GeoPoint(unit.lastLat, unit.lastLng)
+                    m.title = "Eco: ${unit.numeroEconomico}"
                     val d = map.context.getDrawable(org.osmdroid.library.R.drawable.marker_default)?.mutate()
-                    d?.setTint(android.graphics.Color.parseColor("#000080")) // Azul Marino
-                    m.icon = d; map.overlays.add(m)
+                    d?.setTint(android.graphics.Color.parseColor("#000080"))
+                    m.icon = d
+                    map.overlays.add(m)
                 }
             }
+
+            // Pintar ruta por calles (o línea recta si OSRM no respondió aún)
             if (startPoint != null && endPoint != null) {
+                val pts = routePoints.ifEmpty { listOf(startPoint, endPoint) }
+
+                val line = Polyline()
+                line.setPoints(pts)
+                line.color = android.graphics.Color.parseColor("#1565C0") // azul oscuro
+                line.width = 8f
+                map.overlays.add(line)
+
+                // Marcador Origen (azul marino)
                 val sM = Marker(map); sM.position = startPoint; sM.title = "Origen"
-                val sD = map.context.getDrawable(org.osmdroid.library.R.drawable.marker_default)?.mutate(); sD?.setTint(android.graphics.Color.parseColor("#000080")); sM.icon = sD; map.overlays.add(sM)
+                val sD = map.context.getDrawable(org.osmdroid.library.R.drawable.marker_default)?.mutate()
+                sD?.setTint(android.graphics.Color.parseColor("#000080")); sM.icon = sD
+                map.overlays.add(sM)
+
+                // Marcador Destino (rojo)
                 val eM = Marker(map); eM.position = endPoint; eM.title = "Destino"
-                val eD = map.context.getDrawable(org.osmdroid.library.R.drawable.marker_default)?.mutate(); eD?.setTint(android.graphics.Color.RED); eM.icon = eD; map.overlays.add(eM)
-                val line = Polyline(); line.addPoint(startPoint); line.addPoint(endPoint); line.color = android.graphics.Color.BLUE; map.overlays.add(line)
-                map.post { map.zoomToBoundingBox(org.osmdroid.util.BoundingBox.fromGeoPoints(listOf(startPoint, endPoint)), true, 150) }
+                val eD = map.context.getDrawable(org.osmdroid.library.R.drawable.marker_default)?.mutate()
+                eD?.setTint(android.graphics.Color.RED); eM.icon = eD
+                map.overlays.add(eM)
+
+                map.post {
+                    map.zoomToBoundingBox(
+                        org.osmdroid.util.BoundingBox.fromGeoPoints(pts), true, 150
+                    )
+                }
             }
+            map.invalidate()
         },
         modifier = modifier
     )
 }
 
 @Composable
-fun MetricsScreen(routes: List<RouteData>, units: List<UnitData>) {
-    var startDate by remember { mutableStateOf("") }; var endDate by remember { mutableStateOf("") }; val context = LocalContext.current; val calendar = Calendar.getInstance()
-    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+fun MetricsScreen(routes: List<RouteData>, units: List<UnitData>, fuelList: List<FuelData>) {
+    var startDate by remember { mutableStateOf("") }
+    var endDate   by remember { mutableStateOf("") }
+    val context  = LocalContext.current
+    val calendar = Calendar.getInstance()
+
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 16.dp)) {
         Text("Métricas de Flota", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(12.dp))
+
+        // ── Filtro de fechas ──────────────────────────────────────────────────
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { DatePickerDialog(context, { _, y, m, d -> startDate = String.format("%04d-%02d-%02d", y, m + 1, d) }, calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH)).show() }, modifier = Modifier.weight(1f)) { Text(if (startDate.isEmpty()) "Inicio" else startDate) }
-            OutlinedButton(onClick = { DatePickerDialog(context, { _, y, m, d -> endDate = String.format("%04d-%02d-%02d", y, m + 1, d) }, calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH)).show() }, modifier = Modifier.weight(1f)) { Text(if (endDate.isEmpty()) "Fin" else endDate) }
+            OutlinedButton(
+                onClick = { DatePickerDialog(context, { _, y, m, d -> startDate = String.format("%04d-%02d-%02d", y, m + 1, d) }, calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH)).show() },
+                modifier = Modifier.weight(1f)
+            ) { Text(if (startDate.isEmpty()) "Inicio" else startDate) }
+            OutlinedButton(
+                onClick = { DatePickerDialog(context, { _, y, m, d -> endDate = String.format("%04d-%02d-%02d", y, m + 1, d) }, calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH)).show() },
+                modifier = Modifier.weight(1f)
+            ) { Text(if (endDate.isEmpty()) "Fin" else endDate) }
         }
+
         if (startDate.isNotEmpty() && endDate.isNotEmpty()) {
-            val filtered = routes.filter { it.fecha in startDate..endDate }
-            Card(modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
-                Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) { Text("Total Viajes"); Text("${filtered.size}", fontSize = 48.sp, fontWeight = FontWeight.Black) }
+            val filteredRoutes = routes.filter { it.fecha in startDate..endDate }
+            val filteredFuel   = fuelList.filter { it.fecha.take(10) in startDate..endDate }
+
+            Spacer(Modifier.height(16.dp))
+
+            // ── Tarjeta: Total viajes ─────────────────────────────────────────
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+            ) {
+                Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("Total Viajes")
+                    Text("${filteredRoutes.size}", fontSize = 48.sp, fontWeight = FontWeight.Black)
+                }
             }
+
+            Spacer(Modifier.height(16.dp))
+
+            // ── Unidades activas (con al menos 1 ruta en el periodo) ──────────
+            val activeUnitIds = filteredRoutes.map { it.unitId }.toSet()
+            val activeUnits   = units.filter { it.id in activeUnitIds }
+
+            Text("Unidades Activas (${activeUnits.size} / ${units.size})", fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+
+            if (activeUnits.isEmpty()) {
+                Text("Sin actividad en el periodo seleccionado.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                activeUnits.forEach { unit ->
+                    val viajesUnidad = filteredRoutes.count { it.unitId == unit.id }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.LocalShipping, null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Eco ${unit.numeroEconomico}", modifier = Modifier.weight(1f), fontWeight = FontWeight.Medium)
+                        Text("$viajesUnidad viaje${if (viajesUnidad != 1) "s" else ""}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(20.dp))
+
+            // ── Combustible por unidad ────────────────────────────────────────
+            Text("Gasto de Combustible por Unidad", fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+
+            if (filteredFuel.isEmpty()) {
+                Text("Sin registros de combustible en el periodo.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                // Agrupar por unidad
+                val fuelByUnit = filteredFuel.groupBy { it.unitId }
+                val maxTotal = fuelByUnit.values.maxOfOrNull { g -> g.sumOf { it.total.toDoubleOrNull() ?: 0.0 } }?.coerceAtLeast(1.0) ?: 1.0
+
+                // Totales globales
+                val totalLitros = filteredFuel.sumOf { it.cantidad.toDoubleOrNull() ?: 0.0 }
+                val totalGasto  = filteredFuel.sumOf { it.total.toDoubleOrNull() ?: 0.0 }
+
+                // Resumen global
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Card(modifier = Modifier.weight(1f), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
+                        Column(modifier = Modifier.padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("Total Litros", style = MaterialTheme.typography.bodySmall)
+                            Text(String.format("%.1f L", totalLitros), fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                        }
+                    }
+                    Card(modifier = Modifier.weight(1f), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)) {
+                        Column(modifier = Modifier.padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("Total Gastado", style = MaterialTheme.typography.bodySmall)
+                            Text(String.format("$%.2f", totalGasto), fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // Detalle por unidad con barra proporcional
+                fuelByUnit.forEach { (unitId, registros) ->
+                    val unitEco   = registros.first().unitEco
+                    val litros    = registros.sumOf { it.cantidad.toDoubleOrNull() ?: 0.0 }
+                    val gasto     = registros.sumOf { it.total.toDoubleOrNull() ?: 0.0 }
+                    val proporcion = (gasto / maxTotal).toFloat().coerceIn(0f, 1f)
+                    val cargas    = registros.size
+
+                    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Eco $unitEco", fontWeight = FontWeight.Medium)
+                            Text(String.format("$%.2f · %.1f L · %d carga%s", gasto, litros, cargas, if (cargas != 1) "s" else ""),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Box(modifier = Modifier.fillMaxWidth().height(10.dp).background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(5.dp))) {
+                            Box(modifier = Modifier.fillMaxWidth(proporcion).height(10.dp).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(5.dp)))
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(20.dp))
+
+            // ── Gráfico de actividad ──────────────────────────────────────────
             Text("Gráfico de Actividad", fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
             val isSingle = startDate == endDate
-            val data = if (isSingle) (0..23).associate { String.format("%02d:00", it) to filtered.count { r -> r.horaInicio.startsWith(String.format("%02d:", it)) } }
-            else generateDateRange(startDate, endDate).associateWith { d -> filtered.count { r -> r.fecha == d } }
+            val data = if (isSingle)
+                (0..23).associate { String.format("%02d:00", it) to filteredRoutes.count { r -> r.horaInicio.startsWith(String.format("%02d:", it)) } }
+            else
+                generateDateRange(startDate, endDate).associateWith { d -> filteredRoutes.count { r -> r.fecha == d } }
+
             Box(modifier = Modifier.fillMaxWidth().height(200.dp).border(1.dp, Color.LightGray, RoundedCornerShape(8.dp)).padding(8.dp)) {
                 Row(modifier = Modifier.fillMaxSize().horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.Bottom) {
                     val max = (data.values.maxOrNull()?.coerceAtLeast(1) ?: 1).toFloat()
@@ -590,7 +841,38 @@ fun CreateRouteDialog(empresaId: String, units: List<UnitData>, onDismiss: () ->
     val context = LocalContext.current; val calendar = Calendar.getInstance()
 
     if (pickingL != null) {
-        AlertDialog(onDismissRequest = { pickingL = null }, title = { Text("Seleccione el $pickingL") }, text = { Box(modifier = Modifier.fillMaxWidth().height(400.dp).clip(RectangleShape)) { OSMView(Modifier.fillMaxSize(), onPointSelected = { p -> if (pickingL == "origen") { oP = p; origenN = String.format("%.4f, %.4f", p.latitude, p.longitude) } else { dP = p; destinoN = String.format("%.4f, %.4f", p.latitude, p.longitude) } }) } }, confirmButton = { Button(onClick = { pickingL = null }) { Text("Confirmar") } })
+        var isGeocoding by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { if (!isGeocoding) pickingL = null },
+            title = { Text("Seleccione el $pickingL") },
+            text = {
+                Column {
+                    Box(modifier = Modifier.fillMaxWidth().height(400.dp).clip(RectangleShape)) {
+                        OSMView(Modifier.fillMaxSize(), onPointSelected = { p ->
+                            isGeocoding = true
+                            CoroutineScope(Dispatchers.Main).launch {
+                                val nombre = withContext(Dispatchers.IO) {
+                                    reverseGeocode(p.latitude, p.longitude)
+                                }
+                                if (pickingL == "origen") { oP = p; origenN = nombre }
+                                else { dP = p; destinoN = nombre }
+                                isGeocoding = false
+                            }
+                        })
+                        if (isGeocoding) {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Card { Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    CircularProgressIndicator(Modifier.size(20.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Obteniendo nombre...")
+                                } }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { Button(onClick = { pickingL = null }, enabled = !isGeocoding) { Text("Confirmar") } }
+        )
     }
 
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Asignar Ruta") }, text = {
@@ -605,19 +887,203 @@ fun CreateRouteDialog(empresaId: String, units: List<UnitData>, onDismiss: () ->
                 OutlinedTextField(value = hF, onValueChange = {}, label = { Text("Fin") }, modifier = Modifier.weight(1f), readOnly = true, trailingIcon = { IconButton(onClick = { TimePickerDialog(context, { _, h, m -> hF = String.format("%02d:%02d", h, m) }, 13, 0, true).show() }) { Icon(Icons.Default.AccessTime, null) } })
             }
         }
-    }, confirmButton = { Button(onClick = { if (selectedU != null && fecha.isNotBlank()) { val db = Firebase.database.reference; val id = db.child("rutas").push().key ?: ""; db.child("rutas").child(id).setValue(RouteData(id, empresaId, selectedU!!.id, selectedU!!.numeroEconomico, cliente, origenN, destinoN, oP?.latitude ?: 0.0, oP?.longitude ?: 0.0, dP?.latitude ?: 0.0, dP?.longitude ?: 0.0, fecha, hI, hF)).addOnSuccessListener { onDismiss() } } }) { Text("Asignar") } })
+    }, confirmButton = { Button(onClick = { if (selectedU != null && fecha.isNotBlank()) { val db = Firebase.database.reference; val id = db.child("rutas").push().key ?: ""; db.child("rutas").child(id).setValue(RouteData(id, empresaId, selectedU!!.id, selectedU!!.numeroEconomico, cliente, origenN, destinoN, oP?.latitude ?: 0.0, oP?.longitude ?: 0.0, dP?.latitude ?: 0.0, dP?.longitude ?: 0.0, fecha, hI, hF)).addOnSuccessListener { onDismiss() } } }) { Text("Asignar") } }, dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } })
 }
 
 @Composable
 fun RoutesListScreen(empresaId: String, onBack: () -> Unit) {
-    var routesList by remember { mutableStateOf<List<RouteData>>(emptyList()) }; var selectedR by remember { mutableStateOf<RouteData?>(null) }
+    var routesList by remember { mutableStateOf<List<RouteData>>(emptyList()) }
+    var viewRoute   by remember { mutableStateOf<RouteData?>(null) }
+    var editRoute   by remember { mutableStateOf<RouteData?>(null) }
     val db = Firebase.database.reference
-    LaunchedEffect(empresaId) { db.child("rutas").orderByChild("empresaId").equalTo(empresaId).addValueEventListener(object : ValueEventListener { override fun onDataChange(s: DataSnapshot) { routesList = s.children.mapNotNull { it.getValue(RouteData::class.java) } }; override fun onCancelled(e: DatabaseError) {} }) }
-    if (selectedR != null) { AlertDialog(onDismissRequest = { selectedR = null }, title = { Text("Ruta") }, text = { Box(modifier = Modifier.fillMaxWidth().height(400.dp).clip(RectangleShape)) { OSMView(modifier = Modifier.fillMaxSize(), startPoint = GeoPoint(selectedR!!.origenLat, selectedR!!.origenLng), endPoint = GeoPoint(selectedR!!.destinoLat, selectedR!!.destinoLng)) } }, confirmButton = { Button(onClick = { selectedR = null }) { Text("Cerrar") } }) }
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) }; Text("Viajes Asignados", fontWeight = FontWeight.Bold) }
-        LazyColumn(modifier = Modifier.weight(1f)) { items(routesList) { r -> Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) { Column(modifier = Modifier.padding(12.dp)) { Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("Unidad: ${r.unitEco}", fontWeight = FontWeight.Bold); IconButton(onClick = { selectedR = r }) { Icon(Icons.Default.Map, null, tint = MaterialTheme.colorScheme.primary) } }; Text("Cliente: ${r.cliente}"); Text("${r.fecha} | ${r.horaInicio}"); Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) { IconButton(onClick = { db.child("rutas").child(r.id).removeValue() }) { Icon(Icons.Default.Delete, null, tint = Color.Red) } } } } } }
+
+    LaunchedEffect(empresaId) {
+        db.child("rutas").orderByChild("empresaId").equalTo(empresaId)
+            .addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(s: DataSnapshot) {
+                    routesList = s.children.mapNotNull { it.getValue(RouteData::class.java) }
+                }
+                override fun onCancelled(e: DatabaseError) {}
+            })
     }
+
+    // Diálogo: ver ruta en mapa
+    if (viewRoute != null) {
+        AlertDialog(
+            onDismissRequest = { viewRoute = null },
+            title = { Text("Ruta: ${viewRoute!!.cliente}") },
+            text = {
+                Box(modifier = Modifier.fillMaxWidth().height(400.dp).clip(RectangleShape)) {
+                    OSMView(
+                        modifier = Modifier.fillMaxSize(),
+                        startPoint = GeoPoint(viewRoute!!.origenLat, viewRoute!!.origenLng),
+                        endPoint   = GeoPoint(viewRoute!!.destinoLat, viewRoute!!.destinoLng)
+                    )
+                }
+            },
+            confirmButton = { Button(onClick = { viewRoute = null }) { Text("Cerrar") } }
+        )
+    }
+
+    // Diálogo: editar ruta
+    if (editRoute != null) {
+        EditRouteDialog(route = editRoute!!, onDismiss = { editRoute = null })
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) }
+            Text("Viajes Asignados", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+        }
+        Spacer(Modifier.height(8.dp))
+        if (routesList.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("No hay viajes asignados aún.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        } else {
+            LazyColumn(modifier = Modifier.weight(1f)) {
+                items(routesList) { r ->
+                    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Text("Unidad: ${r.unitEco}", fontWeight = FontWeight.Bold)
+                                Row {
+                                    // Ver en mapa
+                                    IconButton(onClick = { viewRoute = r }) {
+                                        Icon(Icons.Default.Map, null, tint = MaterialTheme.colorScheme.primary)
+                                    }
+                                    // Editar
+                                    IconButton(onClick = { editRoute = r }) {
+                                        Icon(Icons.Default.Edit, null, tint = MaterialTheme.colorScheme.secondary)
+                                    }
+                                    // Eliminar
+                                    IconButton(onClick = { db.child("rutas").child(r.id).removeValue() }) {
+                                        Icon(Icons.Default.Delete, null, tint = Color.Red)
+                                    }
+                                }
+                            }
+                            Text("Cliente: ${r.cliente}")
+                            Text("${r.origenName}  →  ${r.destinoName}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("${r.fecha}  |  ${r.horaInicio} – ${r.horaFin}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun EditRouteDialog(route: RouteData, onDismiss: () -> Unit) {
+    var cliente  by remember { mutableStateOf(route.cliente) }
+    var origenN  by remember { mutableStateOf(route.origenName) }
+    var destinoN by remember { mutableStateOf(route.destinoName) }
+    var fecha    by remember { mutableStateOf(route.fecha) }
+    var hI       by remember { mutableStateOf(route.horaInicio) }
+    var hF       by remember { mutableStateOf(route.horaFin) }
+    var oP       by remember { mutableStateOf(if (route.origenLat != 0.0) GeoPoint(route.origenLat, route.origenLng) else null) }
+    var dP       by remember { mutableStateOf(if (route.destinoLat != 0.0) GeoPoint(route.destinoLat, route.destinoLng) else null) }
+    var pickingL by remember { mutableStateOf<String?>(null) }
+    val context  = LocalContext.current
+    val calendar = Calendar.getInstance()
+
+    if (pickingL != null) {
+        var isGeocoding by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { if (!isGeocoding) pickingL = null },
+            title = { Text("Seleccione el $pickingL") },
+            text = {
+                Column {
+                    Box(modifier = Modifier.fillMaxWidth().height(400.dp).clip(RectangleShape)) {
+                        OSMView(Modifier.fillMaxSize(), onPointSelected = { p ->
+                            isGeocoding = true
+                            CoroutineScope(Dispatchers.Main).launch {
+                                val nombre = withContext(Dispatchers.IO) {
+                                    reverseGeocode(p.latitude, p.longitude)
+                                }
+                                if (pickingL == "origen") { oP = p; origenN = nombre }
+                                else { dP = p; destinoN = nombre }
+                                isGeocoding = false
+                            }
+                        })
+                        if (isGeocoding) {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Card { Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    CircularProgressIndicator(Modifier.size(20.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Obteniendo nombre...")
+                                } }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { Button(onClick = { pickingL = null }, enabled = !isGeocoding) { Text("Confirmar") } }
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Editar Ruta") },
+        text = {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(value = cliente, onValueChange = { cliente = it }, label = { Text("Cliente") }, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(
+                    value = origenN, onValueChange = { origenN = it },
+                    label = { Text("Origen") }, modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = { IconButton(onClick = { pickingL = "origen" }) { Icon(Icons.Default.Map, null) } }
+                )
+                OutlinedTextField(
+                    value = destinoN, onValueChange = { destinoN = it },
+                    label = { Text("Destino") }, modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = { IconButton(onClick = { pickingL = "destino" }) { Icon(Icons.Default.Map, null) } }
+                )
+                OutlinedTextField(
+                    value = fecha, onValueChange = {}, label = { Text("Fecha") },
+                    modifier = Modifier.fillMaxWidth(), readOnly = true,
+                    trailingIcon = {
+                        IconButton(onClick = {
+                            DatePickerDialog(context, { _, y, m, d ->
+                                fecha = String.format("%04d-%02d-%02d", y, m + 1, d)
+                            }, calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH)).show()
+                        }) { Icon(Icons.Default.CalendarToday, null) }
+                    }
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = hI, onValueChange = {}, label = { Text("Inicio") },
+                        modifier = Modifier.weight(1f), readOnly = true,
+                        trailingIcon = { IconButton(onClick = { TimePickerDialog(context, { _, h, m -> hI = String.format("%02d:%02d", h, m) }, 12, 0, true).show() }) { Icon(Icons.Default.AccessTime, null) } }
+                    )
+                    OutlinedTextField(
+                        value = hF, onValueChange = {}, label = { Text("Fin") },
+                        modifier = Modifier.weight(1f), readOnly = true,
+                        trailingIcon = { IconButton(onClick = { TimePickerDialog(context, { _, h, m -> hF = String.format("%02d:%02d", h, m) }, 13, 0, true).show() }) { Icon(Icons.Default.AccessTime, null) } }
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val db = Firebase.database.reference
+                val updates = mapOf(
+                    "cliente"    to cliente,
+                    "origenName" to origenN,
+                    "destinoName" to destinoN,
+                    "origenLat"  to (oP?.latitude ?: route.origenLat),
+                    "origenLng"  to (oP?.longitude ?: route.origenLng),
+                    "destinoLat" to (dP?.latitude ?: route.destinoLat),
+                    "destinoLng" to (dP?.longitude ?: route.destinoLng),
+                    "fecha"      to fecha,
+                    "horaInicio" to hI,
+                    "horaFin"    to hF
+                )
+                db.child("rutas").child(route.id).updateChildren(updates)
+                    .addOnSuccessListener { onDismiss() }
+            }) { Text("Guardar") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } }
+    )
 }
 
 @Composable
@@ -626,8 +1092,103 @@ fun UserItem(user: UserData, onDelete: () -> Unit, onChangeRole: (String) -> Uni
 }
 
 @Composable
-fun UnitItem(unit: UnitData, onDelete: () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) { Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) { Column(modifier = Modifier.weight(1f)) { Text("Eco: ${unit.numeroEconomico}"); Text("Placas: ${unit.placas}") }; IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, null, tint = Color.Red) } } }
+fun UnitItem(unit: UnitData, empresaId: String, onDelete: () -> Unit) {
+    var showFuelDialog by remember { mutableStateOf(false) }
+
+    if (showFuelDialog) {
+        ManagerFuelDialog(unit = unit, empresaId = empresaId, onDismiss = { showFuelDialog = false })
+    }
+
+    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Eco: ${unit.numeroEconomico}", fontWeight = FontWeight.Bold)
+                Text("Placas: ${unit.placas}")
+            }
+            IconButton(onClick = { showFuelDialog = true }) {
+                Icon(Icons.Default.LocalGasStation, contentDescription = "Registrar diesel", tint = MaterialTheme.colorScheme.primary)
+            }
+            IconButton(onClick = onDelete) {
+                Icon(Icons.Default.Delete, null, tint = Color.Red)
+            }
+        }
+    }
+}
+
+@Composable
+fun ManagerFuelDialog(unit: UnitData, empresaId: String, onDismiss: () -> Unit) {
+    var cantidad by remember { mutableStateOf("") }
+    var precio   by remember { mutableStateOf("") }
+    var total    by remember { mutableStateOf("") }
+    val context  = LocalContext.current
+
+    // Calcular total automáticamente cuando cambian litros o precio
+    LaunchedEffect(cantidad, precio) {
+        val c = cantidad.toDoubleOrNull()
+        val p = precio.toDoubleOrNull()
+        if (c != null && p != null) total = String.format("%.2f", c * p)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.LocalGasStation, null, tint = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.width(8.dp))
+                Column {
+                    Text("Registrar Diesel")
+                    Text("Eco: ${unit.numeroEconomico} · ${unit.placas}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = cantidad, onValueChange = { cantidad = it },
+                    label = { Text("Litros cargados") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = precio, onValueChange = { precio = it },
+                    label = { Text("Precio por litro ($)") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = total, onValueChange = { total = it },
+                    label = { Text("Total pagado ($)") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text(
+                    "El total se calcula automáticamente, pero puedes editarlo.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = cantidad.isNotBlank() && total.isNotBlank(),
+                onClick = {
+                    val db = Firebase.database.reference
+                    val id = db.child("fuel").push().key ?: ""
+                    val fuel = FuelData(
+                        id, empresaId, unit.id, unit.numeroEconomico,
+                        cantidad, precio, total, 0.0, 0.0,
+                        SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
+                    )
+                    db.child("fuel").child(id).setValue(fuel).addOnSuccessListener {
+                        Toast.makeText(context, "Diesel registrado para ${unit.numeroEconomico}", Toast.LENGTH_SHORT).show()
+                        onDismiss()
+                    }
+                }
+            ) { Text("Registrar") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancelar") }
+        }
+    )
 }
 
 @Composable
