@@ -60,6 +60,34 @@ import org.osmdroid.views.overlay.Polyline
 import java.text.SimpleDateFormat
 import java.util.*
 
+// Función que evalúa si una unidad ya entró a la geocerca del destino
+fun verificarGeocerca(
+    unidadLat: Double,
+    unidadLng: Double,
+    destinoLat: Double,
+    destinoLng: Double,
+    radioMetros: Float = 100f // El tamaño de tu cerca (100 metros por defecto)
+): String {
+
+    // Un arreglo vacío donde Android guardará el resultado del cálculo
+    val resultados = FloatArray(1)
+
+    android.location.Location.distanceBetween(
+        unidadLat, unidadLng,
+        destinoLat, destinoLng,
+        resultados
+    )
+
+    // Extraemos la distancia en metros
+    val distanciaEnMetros = resultados[0]
+
+    // Evaluamos la lógica (El If/Else de la simulación)
+    return if (distanciaEnMetros <= radioMetros) {
+        "¡Llegada registrada! (Dentro de zona)"
+    } else {
+        "En ruta (A ${distanciaEnMetros.toInt()} metros del destino)"
+    }
+}
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -394,8 +422,19 @@ fun DriverDashboard(user: UserData, selectedTab: Int) {
             }
         }
     }
+    // Agrega este bloque para sincronizar la unidad seleccionada en tiempo real
+    LaunchedEffect(unitsList) {
+        if (selectedUnit != null) {
+            // Busca la versión más fresca del camión en la lista y actualiza la variable
+            selectedUnit = unitsList.find { it.id == selectedUnit!!.id } ?: selectedUnit
+        }
+    }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+    Column(modifier = Modifier
+        .fillMaxSize()
+        .padding(16.dp)
+        .verticalScroll(rememberScrollState()) // <--- Esto permite deslizar la pantalla
+    ) {
         if (selectedTab == 0) {
             Text("Operación de Viaje", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(16.dp))
@@ -412,24 +451,62 @@ fun DriverDashboard(user: UserData, selectedTab: Int) {
                             Text("Cliente: ${selectedRoute!!.cliente}", fontWeight = FontWeight.Bold)
                             Text("Ruta: ${selectedRoute!!.origenName} -> ${selectedRoute!!.destinoName}")
                             Text("Fecha: ${selectedRoute!!.fecha}")
+
+                            Spacer(modifier = Modifier.height(8.dp)) // Un pequeño espacio
+
+                            // --- AQUÍ METEMOS LA LÓGICA DE GEOCERCA ---
+                            // Verificamos la distancia entre el camión actual y el destino de su ruta
+                            val estadoLlegada = verificarGeocerca(
+                                unidadLat = selectedUnit!!.lastLat,
+                                unidadLng = selectedUnit!!.lastLng,
+                                destinoLat = selectedRoute!!.destinoLat,
+                                destinoLng = selectedRoute!!.destinoLng,
+                                radioMetros = 150f // Le ponemos un margen de 150 metros (1 cuadra y media)
+                            )
+
+                            // Lo mostramos visualmente con un chip de estado
+                            Surface(
+                                color = if (estadoLlegada.contains("Llegada")) Color(0xFFE8F5E9) else Color(0xFFFFF3E0),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = "Estado GPS: $estadoLlegada",
+                                    color = if (estadoLlegada.contains("Llegada")) Color(0xFF2E7D32) else Color(0xFFE65100),
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(8.dp),
+                                    textAlign = TextAlign.Center
+                                )
+                            }
                         }
                     }
                     Box(modifier = Modifier.fillMaxWidth().height(250.dp).padding(vertical = 16.dp).clip(RoundedCornerShape(8.dp))) {
                         OSMView(Modifier.fillMaxSize(), startPoint = GeoPoint(selectedRoute!!.origenLat, selectedRoute!!.origenLng), endPoint = GeoPoint(selectedRoute!!.destinoLat, selectedRoute!!.destinoLng))
                     }
-                    Button(onClick = { 
-                        try {
-                            fusedLocationClient.lastLocation.addOnSuccessListener { loc ->
-                                if (loc != null) {
-                                    db.child("unidades").child(selectedUnit!!.id).updateChildren(mapOf("lastLat" to loc.latitude, "lastLng" to loc.longitude))
-                                    Toast.makeText(context, "Ubicación actualizada correctamente", Toast.LENGTH_SHORT).show()
+                    Button(
+                        onClick = {
+                            try {
+                                fusedLocationClient.lastLocation.addOnSuccessListener { loc ->
+                                    if (loc != null) {
+                                        // Si hay GPS, actualiza la base de datos
+                                        db.child("unidades").child(selectedUnit!!.id).updateChildren(
+                                            mapOf("lastLat" to loc.latitude, "lastLng" to loc.longitude)
+                                        )
+                                        Toast.makeText(context, "Ubicación actualizada correctamente", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        // Si el GPS está dormido, te avisa en pantalla
+                                        Toast.makeText(context, "GPS inactivo. Abre Google Maps en el emulador por 5 segundos.", Toast.LENGTH_LONG).show()
+                                    }
                                 }
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Faltan permisos de ubicación", Toast.LENGTH_SHORT).show()
                             }
-                        } catch (e: Exception) {}
-                    }, modifier = Modifier.fillMaxWidth()) {
+                        },
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 32.dp) // Un poco de margen abajo
+                    ) {
                         Icon(Icons.Default.MyLocation, null)
                         Spacer(Modifier.width(8.dp))
-                        Text("Enviar Ubicación Actual") 
+                        Text("Enviar Ubicación Actual")
                     }
                 }
             }
