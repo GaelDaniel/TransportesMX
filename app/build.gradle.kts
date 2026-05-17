@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.invendiario"
+    namespace = "com.example.transportesmx"
     compileSdk = 36
 
     defaultConfig {
@@ -52,10 +52,8 @@ dependencies {
     implementation("com.google.firebase:firebase-auth-ktx")
     implementation("com.google.firebase:firebase-database-ktx")
 
-    // OpenStreetMap (Alternativa Gratis)
+    // Mapas y Ubicación
     implementation("org.osmdroid:osmdroid-android:6.1.20")
-    
-    // Ubicación
     implementation("com.google.android.gms:play-services-location:21.3.0")
 
     testImplementation(libs.junit)
